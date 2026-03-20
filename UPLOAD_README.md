@@ -1,68 +1,52 @@
-# Texture To DTX Upload Package
+# 贴图转 DTX 工具说明
 
-## Package Purpose
+## 工具用途
 
-This package contains:
+这个工具包包含：
 
 - `texture_to_dtx_converter.exe`
-  Batch converts `bmp`, `jpg`, `jpeg`, `png`, and `tga` textures to `dtx`.
+  批量将 `bmp`、`jpg`、`jpeg`、`png`、`tga` 贴图转换为 `dtx`
 - `relink_project_textures_to_dtx.ms`
-  3ds Max script that relinks scene bitmap textures to existing `.dtx` files under a chosen project folder.
+  3ds Max 脚本，用于把场景中的位图贴图重定向到项目目录里已有的 `.dtx` 文件
 
-## Files To Upload
 
-Upload these files:
+## 转换器功能说明
 
-- `dist/texture_to_dtx_converter.exe`
-- `max_texture_relink/relink_project_textures_to_dtx.ms`
-- `UPLOAD_README.md`
+`texture_to_dtx_converter.exe` 的行为如下：
 
-Optional source files for archive/debug use:
+- 扫描 exe 所在目录及其所有子目录
+- 支持 `bmp`、`jpg`、`jpeg`、`png`、`tga`
+- 自动跳过 `output_dtx`、`dist`、`build`、`__pycache__` 目录
+- 超过 `1024` 的贴图会自动缩小
+- 非正方形或非 2 次幂尺寸的贴图会自动补成兼容的正方形 2 次幂尺寸
+- 如果源图包含透明像素，生成的 `.dtx` 会自动写入 `alpharef 128`
+- 输出结果统一放到 `output_dtx` 目录
+- 保留原始目录结构
+- 运行时显示进度窗口
+- 生成日志文件 `convert_to_dtx.log`
 
-- `texture_to_dtx_converter.py`
-- `dtxutil.exe`
+## 使用方法
 
-## Converter Behavior
+### 1. 批量转换贴图
 
-`texture_to_dtx_converter.exe` will:
+1. 把 `texture_to_dtx_converter.exe` 放到贴图根目录
+2. 确保同目录下有：
+   `dtxutil.exe`
+   `MFC71.dll`
+   `msvcr71.dll`
+3. 双击运行 exe
+4. 等待进度窗口处理完成
+5. 到生成的 `output_dtx` 目录查看结果
 
-- scan the folder where the exe is placed, including subfolders
-- support `bmp`, `jpg`, `jpeg`, `png`, and `tga`
-- resize textures larger than `1024`
-- pad non-square or non-power-of-two textures to a compatible square power-of-two size
-- output converted files to `output_dtx`
-- preserve original folder structure inside `output_dtx`
-- show a progress window during processing
-- write a log file named `convert_to_dtx.log`
+### 2. 在 3ds Max 里重定向贴图
 
-## How To Use
+1. 在 3ds Max 里运行 `relink_project_textures_to_dtx.ms`
+2. 选择已经包含 `.dtx` 文件的项目贴图目录
+3. 点击 `Relink`
 
-### 1. Convert textures
+## 说明
 
-1. Put `texture_to_dtx_converter.exe` into the texture root folder.
-2. Double-click the exe.
-3. Wait for the progress window to finish.
-4. Check the generated `output_dtx` folder.
+- Max 脚本只负责重定向已有的 `.dtx` 文件，不会执行转换
+- 匹配方式基于“贴图文件名去掉扩展名”
+- 如果不同目录下存在同名 `.dtx`，脚本只会使用第一个找到的文件
 
-### 2. Relink in 3ds Max
-
-1. Run `relink_project_textures_to_dtx.ms` in 3ds Max.
-2. Pick the project texture folder that already contains `.dtx` files.
-3. Click `Relink`.
-
-## Notes
-
-- The Max script only relinks existing `.dtx` files. It does not run the converter.
-- Matching is based on texture file name without extension.
-- If duplicate `.dtx` names exist in different folders, only the first indexed file is used.
-
-## Recommended Delivery Structure
-
-```text
-texture_to_dtx_package/
-  dist/
-    texture_to_dtx_converter.exe
-  max_texture_relink/
-    relink_project_textures_to_dtx.ms
-  UPLOAD_README.md
-```

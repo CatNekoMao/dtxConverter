@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,13 @@ SUPPORTED_EXTENSIONS = {".bmp", ".jpg", ".jpeg", ".png", ".tga"}
 OUTPUT_DIR_NAME = "output_dtx"
 LOG_NAME = "convert_to_dtx.log"
 EXCLUDED_DIRS = {OUTPUT_DIR_NAME, "dist", "build", "__pycache__"}
+DTX_HEADER_SIZE = 164
+DTX_COMMAND_OFFSET = 36
+DTX_COMMAND_LENGTH = 128
+DTX_RESTYPE = 0
+DTX_VERSION = -5
+DTX_BPP_32 = 3
+ALPHA_REF_COMMAND = "alpharef 128"
 
 
 @dataclass
@@ -26,6 +34,7 @@ class ProgressInfo:
     success_count: int = 0
     failure_count: int = 0
     adjusted_count: int = 0
+    alpha_ref_count: int = 0
     current_file: str = ""
     stage: str = ""
 
@@ -43,7 +52,7 @@ class ProgressWindow:
         self.status_var = StringVar(value="Preparing...")
         self.file_var = StringVar(value="Current file: -")
         self.count_var = StringVar(value="Progress: 0 / 0")
-        self.result_var = StringVar(value="Succeeded: 0    Failed: 0    Adjusted: 0")
+        self.result_var = StringVar(value="Succeeded: 0    Failed: 0    Resized/Padded: 0    AlphaRef: 0")
         self.path_var = StringVar(value=f"Source folder: {base_dir}")
 
         ttk.Label(container, textvariable=self.status_var).pack(anchor="w")
@@ -66,7 +75,9 @@ class ProgressWindow:
         self.file_var.set(f"Current file: {info.current_file or '-'}")
         self.count_var.set(f"Progress: {info.current} / {info.total}")
         self.result_var.set(
-            f"Succeeded: {info.success_count}    Failed: {info.failure_count}    Adjusted: {info.adjusted_count}"
+            "Succeeded: "
+            f"{info.success_count}    Failed: {info.failure_count}    "
+            f"Resized/Padded: {info.adjusted_count}    AlphaRef: {info.alpha_ref_count}"
         )
         self.progressbar["maximum"] = max(info.total, 1)
         self.progressbar["value"] = info.current
@@ -137,6 +148,14 @@ def normalize_image(image: Image.Image) -> tuple[Image.Image, bool]:
     return canvas, adjusted
 
 
+def image_has_transparency(image: Image.Image) -> bool:
+    if "A" not in image.getbands():
+        return False
+
+    alpha_extrema = image.getchannel("A").getextrema()
+    return alpha_extrema is not None and alpha_extrema[0] < 255
+
+
 def is_in_excluded_dir(path: Path, base_dir: Path) -> bool:
     relative_parts = path.relative_to(base_dir).parts
     return any(part in EXCLUDED_DIRS for part in relative_parts[:-1])
@@ -156,9 +175,10 @@ def convert_image_to_tga(source: Path, relative_source: Path, temp_dir: Path) ->
     temp_tga = (temp_dir / relative_source).with_suffix(".tga")
     temp_tga.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(source) as image:
+        has_alpha = image_has_transparency(image)
         normalized, adjusted = normalize_image(image)
         normalized.save(temp_tga, format="TGA")
-    return temp_tga, adjusted
+    return temp_tga, adjusted, has_alpha
 
 
 def convert_tga_to_dtx(tga_file: Path, output_file: Path) -> None:
@@ -168,18 +188,76 @@ def convert_tga_to_dtx(tga_file: Path, output_file: Path) -> None:
         raise RuntimeError((completed.stderr or completed.stdout).strip() or "dtxutil failed")
 
 
+def read_command_string(data: bytearray) -> str:
+    raw = bytes(data[DTX_COMMAND_OFFSET : DTX_COMMAND_OFFSET + DTX_COMMAND_LENGTH])
+    return raw.split(b"\0", 1)[0].decode("ascii", errors="ignore")
+
+
+def write_command_string(data: bytearray, value: str) -> None:
+    encoded = value.encode("ascii")
+    if len(encoded) >= DTX_COMMAND_LENGTH:
+        raise ValueError(f"Command string too long: {value!r}")
+
+    data[DTX_COMMAND_OFFSET : DTX_COMMAND_OFFSET + DTX_COMMAND_LENGTH] = b"\0" * DTX_COMMAND_LENGTH
+    data[DTX_COMMAND_OFFSET : DTX_COMMAND_OFFSET + len(encoded)] = encoded
+
+
+def patch_dtx_alpha_command(output_file: Path, has_alpha: bool) -> bool:
+    data = bytearray(output_file.read_bytes())
+    if len(data) < DTX_HEADER_SIZE:
+        raise RuntimeError(f"DTX file too small: {output_file}")
+
+    res_type = int.from_bytes(data[0:4], "little", signed=False)
+    version = int.from_bytes(data[4:8], "little", signed=True)
+    bpp_ident = data[26] or DTX_BPP_32
+
+    if res_type != DTX_RESTYPE or version != DTX_VERSION:
+        raise RuntimeError(f"Unsupported DTX header: resType={res_type}, version={version}")
+
+    if bpp_ident != DTX_BPP_32:
+        raise RuntimeError(f"Unsupported DTX pixel format: BPPIdent={bpp_ident}")
+
+    current_command = read_command_string(data).strip()
+    new_command = current_command
+
+    if has_alpha:
+        if re.search(r"(?i)\balpharef\s+\d+\b", current_command):
+            new_command = re.sub(r"(?i)\balpharef\s+\d+\b", ALPHA_REF_COMMAND, current_command, count=1)
+        elif re.search(r"(?i)\balphadef\s+\d+\b", current_command):
+            new_command = re.sub(r"(?i)\balphadef\s+\d+\b", ALPHA_REF_COMMAND, current_command, count=1)
+        elif current_command:
+            new_command = f"{current_command}; {ALPHA_REF_COMMAND}"
+        else:
+            new_command = ALPHA_REF_COMMAND
+
+    if new_command == current_command:
+        return False
+
+    write_command_string(data, new_command)
+    output_file.write_bytes(data)
+    return True
+
+
 def write_log(log_file: Path, lines: list[str]) -> None:
     log_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_summary(base_dir: Path, output_dir: Path, success_count: int, failure_count: int, adjusted_count: int) -> str:
+def build_summary(
+    base_dir: Path,
+    output_dir: Path,
+    success_count: int,
+    failure_count: int,
+    adjusted_count: int,
+    alpha_ref_count: int,
+) -> str:
     log_file = base_dir / LOG_NAME
     return (
         f"Source folder: {base_dir}\n"
         f"Output folder: {output_dir}\n"
         f"Succeeded: {success_count}\n"
         f"Failed: {failure_count}\n"
-        f"Adjusted to compatible size: {adjusted_count}\n"
+        f"Resized or padded to compatible size: {adjusted_count}\n"
+        f"AlphaRef command applied: {alpha_ref_count}\n"
         f"Log: {log_file}"
     )
 
@@ -199,6 +277,7 @@ def run(base_dir: Path | str | None = None, progress_window: ProgressWindow | No
     log_lines: list[str] = []
     success_count = 0
     adjusted_count = 0
+    alpha_ref_count = 0
     progress = ProgressInfo(total=len(input_files), stage="Scanning files...")
 
     if progress_window is not None:
@@ -217,18 +296,26 @@ def run(base_dir: Path | str | None = None, progress_window: ProgressWindow | No
             progress.stage = "Converting image..."
 
             try:
-                temp_tga, adjusted = convert_image_to_tga(source, relative_source, temp_dir)
+                temp_tga, adjusted, has_alpha = convert_image_to_tga(source, relative_source, temp_dir)
                 progress.stage = "Generating DTX..."
                 if progress_window is not None:
                     progress_window.update(progress)
 
                 convert_tga_to_dtx(temp_tga, output_file)
+                alpha_adjusted = patch_dtx_alpha_command(output_file, has_alpha)
                 success_count += 1
                 adjusted_count += int(adjusted)
+                alpha_ref_count += int(alpha_adjusted)
                 progress.success_count = success_count
                 progress.adjusted_count = adjusted_count
-                size_note = " adjusted-to-compatible-size" if adjusted else ""
-                log_lines.append(f"OK   {relative_source} -> {output_file.relative_to(output_dir)}{size_note}")
+                progress.alpha_ref_count = alpha_ref_count
+                notes: list[str] = []
+                if adjusted:
+                    notes.append("adjusted-to-compatible-size")
+                if alpha_adjusted:
+                    notes.append(ALPHA_REF_COMMAND)
+                note_text = f" [{', '.join(notes)}]" if notes else ""
+                log_lines.append(f"OK   {relative_source} -> {output_file.relative_to(output_dir)}{note_text}")
             except Exception as exc:
                 progress.failure_count += 1
                 log_lines.append(f"FAIL {relative_source}: {exc}")
@@ -239,7 +326,7 @@ def run(base_dir: Path | str | None = None, progress_window: ProgressWindow | No
     failure_count = len(input_files) - success_count
     log_file = base_dir / LOG_NAME
     write_log(log_file, log_lines)
-    summary = build_summary(base_dir, output_dir, success_count, failure_count, adjusted_count)
+    summary = build_summary(base_dir, output_dir, success_count, failure_count, adjusted_count, alpha_ref_count)
     return summary, failure_count == 0
 
 
